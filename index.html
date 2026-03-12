@@ -2648,13 +2648,24 @@ function selectPostType(type, btn) {
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('modalMediaFiles').addEventListener('change', function() {
     selectedMediaFiles = Array.from(this.files);
-    const preview = document.getElementById('modalMediaPreview');
-    preview.innerHTML = selectedMediaFiles.map((f,i) => `
-      <div style="position:relative;display:inline-block;">
-        <img src="${URL.createObjectURL(f)}" style="width:80px;height:80px;object-fit:cover;border-radius:8px;border:2px solid var(--border);"/>
-        <button onclick="removeMediaFile(${i})" style="position:absolute;top:-4px;right:-4px;width:18px;height:18px;background:#EF4444;border:none;border-radius:50%;color:#fff;font-size:10px;cursor:pointer;">x</button>
-      </div>
-    `).join('');
+    renderMediaPreview(selectedMediaFiles, 'modalMediaPreview');
+  });
+
+  // Composer media preview
+  document.getElementById('composerMedia').addEventListener('change', function() {
+    const files = Array.from(this.files);
+    const preview = document.getElementById('composerMediaPreview');
+    preview.innerHTML = '';
+    files.forEach(f => {
+      const url = URL.createObjectURL(f);
+      const isVideo = f.type.startsWith('video/');
+      const el = document.createElement('div');
+      el.style.cssText = 'position:relative;display:inline-block;';
+      el.innerHTML = isVideo
+        ? `<video src="${url}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;" muted></video>`
+        : `<img src="${url}" style="width:70px;height:70px;object-fit:cover;border-radius:8px;"/>`;
+      preview.appendChild(el);
+    });
   });
 
   document.getElementById('composerText').addEventListener('input', function() {
@@ -2749,15 +2760,31 @@ document.addEventListener('DOMContentLoaded', () => {
   ).join('');
 });
 
+// Simpan preview URLs agar tidak re-create blob URL
+let previewObjectURLs = [];
+
+function renderMediaPreview(files, containerId) {
+  // Revoke URL lama untuk hindari memory leak
+  previewObjectURLs.forEach(u => URL.revokeObjectURL(u));
+  previewObjectURLs = files.map(f => URL.createObjectURL(f));
+  const preview = document.getElementById(containerId);
+  preview.innerHTML = previewObjectURLs.map((url, i) => {
+    const isVideo = files[i] && files[i].type.startsWith('video/');
+    const thumb = isVideo
+      ? `<video src="${url}" style="width:80px;height:80px;object-fit:cover;border-radius:8px;" muted></video>`
+      : `<img src="${url}" style="width:80px;height:80px;object-fit:cover;border-radius:8px;border:2px solid var(--border);"/>`;
+    return `<div style="position:relative;display:inline-block;">
+      ${thumb}
+      <button onclick="removeMediaFile(${i})" style="position:absolute;top:-4px;right:-4px;width:18px;height:18px;background:#EF4444;border:none;border-radius:50%;color:#fff;font-size:10px;cursor:pointer;line-height:1;">x</button>
+    </div>`;
+  }).join('');
+}
+
 function removeMediaFile(idx) {
+  URL.revokeObjectURL(previewObjectURLs[idx]);
   selectedMediaFiles.splice(idx, 1);
-  const preview = document.getElementById('modalMediaPreview');
-  preview.innerHTML = selectedMediaFiles.map((f,i) => `
-    <div style="position:relative;display:inline-block;">
-      <img src="${URL.createObjectURL(f)}" style="width:80px;height:80px;object-fit:cover;border-radius:8px;border:2px solid var(--border);"/>
-      <button onclick="removeMediaFile(${i})" style="position:absolute;top:-4px;right:-4px;width:18px;height:18px;background:#EF4444;border:none;border-radius:50%;color:#fff;font-size:10px;cursor:pointer;">x</button>
-    </div>
-  `).join('');
+  previewObjectURLs.splice(idx, 1);
+  renderMediaPreview(selectedMediaFiles, 'modalMediaPreview');
 }
 
 function togglePassword(inputId, iconId) {
@@ -2827,6 +2854,12 @@ async function submitPost() {
 }
 
 async function createPost({ content, mediaUrls, type }) {
+  // Buang blob URL - hanya simpan URL yang valid (http/https/data:)
+  const safeMediaUrls = (mediaUrls || []).filter(u =>
+    u && (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('data:'))
+  );
+  mediaUrls = safeMediaUrls;
+
   const hashtags = [...new Set((content.match(/#(\w+)/g)||[]).map(h=>h.slice(1)))];
   const mentions_list = [...new Set((content.match(/@(\w+)/g)||[]).map(m=>m.slice(1)))];
 
@@ -2900,6 +2933,8 @@ async function uploadMediaFiles(files) {
 }
 
 async function uploadSingleFile(file) {
+  // Validasi: jangan upload file kosong
+  if (!file || file.size === 0) return null;
   // ---- Coba Supabase Storage ----
   try {
     const ext = file.name.split('.').pop().toLowerCase();
@@ -3020,9 +3055,16 @@ async function submitStory() {
     const urls = await uploadMediaFiles([file]);
     const isVideo = file.type.startsWith('video/');
 
+    // Jangan simpan blob URL - harus URL permanen
+    const storyUrl = urls[0] && !urls[0].startsWith('blob:') ? urls[0] : null;
+    if (!storyUrl) {
+      showToast('Upload gagal. Pastikan bucket Supabase sudah dibuat.', 'error');
+      return;
+    }
+
     await supabaseclient.from('story_zenith').insert({
       user_id: currentUser.id,
-      media_url: urls[0],
+      media_url: storyUrl,
       caption,
       is_video: isVideo,
       expires_at: new Date(Date.now() + 24*60*60*1000).toISOString()
@@ -3055,9 +3097,15 @@ async function openStories(storyIds) {
     showStory(0);
     document.getElementById('storyViewer').classList.remove('hidden');
 
-    // Record views
-    for (const s of stories) {
-      await supabaseclient.from('story_views_zenith').upsert({ story_id: s.id, viewer_id: currentUser.id });
+    // Record views - ignoreDuplicates agar tidak 409 Conflict
+    if (currentUser) {
+      for (const s of stories) {
+        try {
+          await supabaseclient.from('story_views_zenith')
+            .upsert({ story_id: s.id, viewer_id: currentUser.id, viewed_at: new Date().toISOString() },
+              { onConflict: 'story_id,viewer_id', ignoreDuplicates: true });
+        } catch(_) {}
+      }
     }
   } catch(e) {}
 }
@@ -3420,6 +3468,8 @@ async function saveProfile() {
       avatarUrl = urls[0];
     }
 
+    // Pastikan avatar URL bukan blob (blob tidak persistent)
+    if (avatarUrl && avatarUrl.startsWith('blob:')) avatarUrl = currentUser.avatar_url;
     await supabaseclient.from('users_zenith').update({ name, username, bio, website, avatar_url: avatarUrl }).eq('id',currentUser.id);
     currentUser = { ...currentUser, name, username, bio, website, avatar_url: avatarUrl };
     localStorage.setItem('zenith_session', JSON.stringify({ id: currentUser.id, username }));
