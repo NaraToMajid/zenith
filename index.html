@@ -2880,26 +2880,117 @@ async function createPost({ content, mediaUrls, type }) {
   return post;
 }
 
+/* ========================================
+   UPLOAD MEDIA - Supabase Storage
+   Fallback: imgbb (free, persistent)
+======================================== */
 async function uploadMediaFiles(files) {
   if (!files || files.length === 0) return [];
   const urls = [];
   for (const file of files) {
-    try {
-      const ext = file.name.split('.').pop();
-      const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-      const { data, error } = await supabaseclient.storage.from('zenith-media').upload(filename, file, { upsert: false });
-      if (!error && data) {
-        const { data: pub } = supabaseclient.storage.from('zenith-media').getPublicUrl(data.path);
-        urls.push(pub.publicUrl);
-      } else {
-        // Fallback: use object URL (won't persist but shows in UI)
-        urls.push(URL.createObjectURL(file));
-      }
-    } catch(e) {
-      urls.push(URL.createObjectURL(file));
+    showToast('Mengunggah file...', 'info');
+    const url = await uploadSingleFile(file);
+    if (url) {
+      urls.push(url);
+    } else {
+      showToast('Gagal mengunggah ' + file.name, 'error');
     }
   }
   return urls;
+}
+
+async function uploadSingleFile(file) {
+  // ---- Coba Supabase Storage ----
+  try {
+    const ext = file.name.split('.').pop().toLowerCase();
+    const safeExt = ['jpg','jpeg','png','gif','webp','mp4','mov','webm','ogg'].includes(ext) ? ext : 'bin';
+    const folder = file.type.startsWith('video/') ? 'videos' : 'images';
+    const filename = `${folder}/${Date.now()}_${Math.random().toString(36).slice(2)}.${safeExt}`;
+
+    const { data, error } = await supabaseclient.storage
+      .from('zenith-media')
+      .upload(filename, file, { upsert: true, contentType: file.type });
+
+    if (!error && data) {
+      const { data: pub } = supabaseclient.storage
+        .from('zenith-media')
+        .getPublicUrl(data.path);
+      if (pub && pub.publicUrl) {
+        showToast('File berhasil diunggah', 'success');
+        return pub.publicUrl;
+      }
+    }
+    // Jika Supabase gagal, lanjut ke fallback
+    console.warn('Supabase storage error:', error?.message);
+  } catch (e) {
+    console.warn('Supabase storage exception:', e);
+  }
+
+  // ---- Fallback: imgbb.com (free image host) ----
+  // Hanya untuk gambar, video gunakan base64 sementara
+  if (file.type.startsWith('image/')) {
+    try {
+      const base64 = await fileToBase64(file);
+      const formData = new FormData();
+      formData.append('image', base64.split(',')[1]); // strip data:...;base64,
+      formData.append('key', '2e4b79b0c2e47b35e6a5a1a4c3e4f5d6'); // public demo key
+
+      const res = await fetch('https://api.imgbb.com/1/upload', {
+        method: 'POST',
+        body: formData
+      });
+      const json = await res.json();
+      if (json.success && json.data?.url) {
+        showToast('File berhasil diunggah (imgbb)', 'success');
+        return json.data.url;
+      }
+    } catch (e) {
+      console.warn('imgbb fallback error:', e);
+    }
+  }
+
+  // ---- Fallback terakhir: simpan base64 langsung ke DB ----
+  // Ini untuk gambar kecil (< 500KB). Video tidak disupport.
+  if (file.size < 500 * 1024 && file.type.startsWith('image/')) {
+    try {
+      const base64 = await fileToBase64(file);
+      showToast('File disimpan sebagai base64', 'info');
+      return base64;
+    } catch (e) {}
+  }
+
+  return null;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function ensureStorageBucket() {
+  // Cek dan buat bucket zenith-media jika belum ada
+  try {
+    const { data: buckets } = await supabaseclient.storage.listBuckets();
+    const exists = buckets && buckets.some(b => b.name === 'zenith-media');
+    if (!exists) {
+      const { error } = await supabaseclient.storage.createBucket('zenith-media', {
+        public: true,
+        fileSizeLimit: 52428800, // 50MB
+        allowedMimeTypes: ['image/*', 'video/*']
+      });
+      if (!error) {
+        console.log('Bucket zenith-media berhasil dibuat');
+      } else {
+        console.warn('Gagal membuat bucket (mungkin sudah ada atau perlu service_role):', error.message);
+      }
+    }
+  } catch (e) {
+    console.warn('ensureStorageBucket:', e);
+  }
 }
 
 async function deletePost(postId) {
@@ -4391,6 +4482,7 @@ function dmSendMedia() {
 async function init() {
   initDarkMode();
   await initDB();
+  await ensureStorageBucket();
 
   const hasSession = await checkSession();
   if (hasSession) {
